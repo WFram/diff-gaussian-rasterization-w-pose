@@ -21,15 +21,18 @@ namespace cg = cooperative_groups;
 __device__ void computeColorFromSH(int idx, int deg, int max_coeffs, const glm::vec3* means, glm::vec3 campos, const float* shs, const bool* clamped, const glm::vec3* dL_dcolor, glm::vec3* dL_dmeans, glm::vec3* dL_dshs,  float *dL_dtau)
 {
 	// Compute intermediate values, as it is done during forward
-	glm::vec3 pos = means[idx];
-	glm::vec3 dir_orig = pos - campos;
-	glm::vec3 dir = dir_orig / glm::length(dir_orig);
+	glm::vec3 pos = means[idx];  /* Means of gaussian with id `idx` */
+	glm::vec3 dir_orig = pos - campos;  /* `campos` is a camera center -> mean w.r.t camera center */
+	glm::vec3 dir = dir_orig / glm::length(dir_orig);  /* normalized mean */
 
 	glm::vec3* sh = ((glm::vec3*)shs) + idx * max_coeffs;
 
+	/* TODO: dL/dtau = dL/dsh @ dsh/dtau */
+	/* TODO: dL/dtau = dL/dRGB @ dRGB/dtau */
+
 	// Use PyTorch rule for clamping: if clamping was applied,
 	// gradient becomes 0.
-	glm::vec3 dL_dRGB = dL_dcolor[idx];
+	glm::vec3 dL_dRGB = dL_dcolor[idx];  /* dL/dcolor FOR THE CURRENT GAUSSIAN */
 	dL_dRGB.x *= clamped[3 * idx + 0] ? 0 : 1;
 	dL_dRGB.y *= clamped[3 * idx + 1] ? 0 : 1;
 	dL_dRGB.z *= clamped[3 * idx + 2] ? 0 : 1;
@@ -45,10 +48,11 @@ __device__ void computeColorFromSH(int idx, int deg, int max_coeffs, const glm::
 	glm::vec3* dL_dsh = dL_dshs + idx * max_coeffs;
 
 	// No tricks here, just high school-level calculus.
-	float dRGBdsh0 = SH_C0;
+	float dRGBdsh0 = SH_C0;  /* Since RGB = C0 * sh, dRGB/dsh = C0 */
 	dL_dsh[0] = dRGBdsh0 * dL_dRGB;
 	if (deg > 0)
 	{
+		/* See sh_utils.py for RGB = f(sh) */
 		float dRGBdsh1 = -SH_C1 * y;
 		float dRGBdsh2 = SH_C1 * z;
 		float dRGBdsh3 = -SH_C1 * x;
@@ -125,6 +129,10 @@ __device__ void computeColorFromSH(int idx, int deg, int max_coeffs, const glm::
 		}
 	}
 
+	/* dRGBdx, dRGBdy, dRGBdz show how RGB color changes when changing xyz (view direction to gaussian uC) */
+	/* dL_dRGB shows how loss changes when changing a color */
+	/* dL_ddir shows how loss changes when changing view direction */
+
 	// The view direction is an input to the computation. View direction
 	// is influenced by the Gaussian's mean, so SHs gradients
 	// must propagate back into 3D position.
@@ -138,9 +146,9 @@ __device__ void computeColorFromSH(int idx, int deg, int max_coeffs, const glm::
 	// Additional mean gradient is accumulated in below methods.
 	dL_dmeans[idx] += glm::vec3(dL_dmean.x, dL_dmean.y, dL_dmean.z);
 
-	dL_dtau[6 * idx + 0] += -dL_dmean.x;
+	/* dL_dtau[6 * idx + 0] += -dL_dmean.x;
 	dL_dtau[6 * idx + 1] += -dL_dmean.y;
-	dL_dtau[6 * idx + 2] += -dL_dmean.z;
+	dL_dtau[6 * idx + 2] += -dL_dmean.z; */
 
 }
 
@@ -159,17 +167,20 @@ __global__ void computeCov2DCUDA(int P,
 	float* dL_dcov,
 	float *dL_dtau)
 {
+	/* Take id of current Gaussian */
 	auto idx = cg::this_grid().thread_rank();
 	if (idx >= P || !(radii[idx] > 0))
 		return;
 
-	// Reading location of 3D covariance for this Gaussian
+	// Reading location of 3D covariance for this Gaussian (WORLD frame)
 	const float* cov3D = cov3Ds + 6 * idx;
 
 	// Fetch gradients, recompute 2D covariance and relevant 
 	// intermediate forward results needed in the backward.
-	float3 mean = means[idx];
+	float3 mean = means[idx];  /* mean in WORLD coordinates */
 	float3 dL_dconic = { dL_dconics[4 * idx], dL_dconics[4 * idx + 1], dL_dconics[4 * idx + 3] };
+	/* `view_matrix` is Tcw (CHECKED) */
+	/* mean initially is in `W` frame. Here `t` is `mean` expressed in `C` frame */
 	float3 t = transformPoint4x3(mean, view_matrix);
 	
 	const float limx = 1.3f * tan_fovx;
@@ -179,18 +190,22 @@ __global__ void computeCov2DCUDA(int P,
 	t.x = min(limx, max(-limx, txtz)) * t.z;
 	t.y = min(limy, max(-limy, tytz)) * t.z;
 	
+	/* Some multipliers (probably to reject update) */
 	const float x_grad_mul = txtz < -limx || txtz > limx ? 0 : 1;
 	const float y_grad_mul = tytz < -limy || tytz > limy ? 0 : 1;
 
+	/* Calibration Jacobi matrix */
 	glm::mat3 J = glm::mat3(h_x / t.z, 0.0f, -(h_x * t.x) / (t.z * t.z),
 		0.0f, h_y / t.z, -(h_y * t.y) / (t.z * t.z),
 		0, 0, 0);
 
+	/* `W` is actually `Rwc`. But technically it might be a trick just to suit glm */
 	glm::mat3 W = glm::mat3(
 		view_matrix[0], view_matrix[4], view_matrix[8],
 		view_matrix[1], view_matrix[5], view_matrix[9],
 		view_matrix[2], view_matrix[6], view_matrix[10]);
 
+	/* Gaussian covariance in WORLD frame */
 	glm::mat3 Vrk = glm::mat3(
 		cov3D[0], cov3D[1], cov3D[2],
 		cov3D[1], cov3D[3], cov3D[4],
@@ -198,9 +213,11 @@ __global__ void computeCov2DCUDA(int P,
 
 	glm::mat3 T = W * J;
 
+	/* Gaussian covariance in image plane */
 	glm::mat3 cov2D = glm::transpose(T) * glm::transpose(Vrk) * T;
 
 	// Use helper variables for 2D covariance entries. More compact.
+	// Basically covariance elements
 	float a = cov2D[0][0] += 0.3f;
 	float b = cov2D[0][1];
 	float c = cov2D[1][1] += 0.3f;
@@ -265,30 +282,36 @@ __global__ void computeCov2DCUDA(int P,
 	float tz2 = tz * tz;
 	float tz3 = tz2 * tz;
 
-	// Gradients of loss w.r.t. transformed Gaussian mean t
+	// Gradients of loss w.r.t. transformed Gaussian mean t (dL / duC)
 	float dL_dtx = x_grad_mul * -h_x * tz2 * dL_dJ02;
 	float dL_dty = y_grad_mul * -h_y * tz2 * dL_dJ12;
 	float dL_dtz = -h_x * tz2 * dL_dJ00 - h_y * tz2 * dL_dJ11 + (2 * h_x * t.x) * tz3 * dL_dJ02 + (2 * h_y * t.y) * tz3 * dL_dJ12;
 
+	// THIS PART IS ABSOLUTELY FINE. FORGET THIS
 	SE3 T_CW(view_matrix);
-	mat33 R = T_CW.R().data();
-	mat33 RT = R.transpose();
-	float3 t_ = T_CW.t();
-	mat33 dpC_drho = mat33::identity();
-	mat33 dpC_dtheta = -mat33::skew_symmetric(t);
+	mat33 R = T_CW.R().data();  // Rcw
+	mat33 RT = R.transpose();  // Rwc
+	float3 t_ = T_CW.t();  // tcw
+	/* Derivatives dmuC/dT */
+	mat33 dpC_drho = mat33::identity();  /* duC / dTcw */
+	mat33 dpC_dtheta = -mat33::skew_symmetric(t);  /* duC / dTcw */
 	float dL_dt[6];
+	/* Apply chain rule to compute dL/dTcw = dL/dmuC @ dmuC/dTcw */
+	/* NOTE: HERE EVERYTHING IS CORRECT */
 	for (int i = 0; i < 3; i++) {
 		float3 c_rho = dpC_drho.cols[i];
 		float3 c_theta = dpC_dtheta.cols[i];
 		dL_dt[i] = dL_dtx * c_rho.x + dL_dty * c_rho.y + dL_dtz * c_rho.z;
-		dL_dt[i + 3] = dL_dtx * c_theta.x + dL_dty * c_theta.y + dL_dtz * c_theta.z;
+		dL_dt[i + 3] = dL_dtx * c_theta.x + dL_dty * c_theta.y + dL_dtz * c_theta.z;  // TODO: check computation
 	}
+	/* dL_dtau is a gradient vector where `idx` is an id of gaussian */
 	for (int i = 0; i < 6; i++) {
 		dL_dtau[6 * idx + i] += dL_dt[i];
 	}
 
 	// Account for transformation of mean to t
 	// t = transformPoint4x3(mean, view_matrix);
+	/* Transforms gradients to `C` frame */
 	float3 dL_dmean = transformVec4x3Transpose({ dL_dtx, dL_dty, dL_dtz }, view_matrix);
 
 	// Gradients of loss w.r.t. Gaussian means, but only the portion 
@@ -296,6 +319,7 @@ __global__ void computeCov2DCUDA(int P,
 	// Additional mean gradient is accumulated in BACKWARD::preprocess.
 	dL_dmeans[idx] = dL_dmean;
 
+	/* TODO: check these derivatives */
 	float dL_dW00 = J[0][0] * dL_dT00;
 	float dL_dW01 = J[0][0] * dL_dT01;
 	float dL_dW02 = J[0][0] * dL_dT02;
@@ -306,6 +330,7 @@ __global__ void computeCov2DCUDA(int P,
 	float dL_dW21 = J[0][2] * dL_dT01 + J[1][2] * dL_dT11;
 	float dL_dW22 = J[0][2] * dL_dT02 + J[1][2] * dL_dT12;
 
+	/* W:,1 , W:,2 , W:,3 */
 	float3 c1 = R.cols[0];
 	float3 c2 = R.cols[1];
 	float3 c3 = R.cols[2];
@@ -326,23 +351,49 @@ __global__ void computeCov2DCUDA(int P,
 	float3 dL_dWc2 = dL_dW.cols[1];
 	float3 dL_dWc3 = dL_dW.cols[2];
 
+	/* dW/dRcw */
 	mat33 n_W1_x = -mat33::skew_symmetric(c1);
 	mat33 n_W2_x = -mat33::skew_symmetric(c2);
 	mat33 n_W3_x = -mat33::skew_symmetric(c3);
 
-	float3 dL_dtheta = {};
+	/* float3 dL_dtheta = {};
 	dL_dtheta.x = dot(dL_dWc1, n_W1_x.cols[0]) + dot(dL_dWc2, n_W2_x.cols[0]) +
 				dot(dL_dWc3, n_W3_x.cols[0]);
 	dL_dtheta.y = dot(dL_dWc1, n_W1_x.cols[1]) + dot(dL_dWc2, n_W2_x.cols[1]) +
 				dot(dL_dWc3, n_W3_x.cols[1]);
 	dL_dtheta.z = dot(dL_dWc1, n_W1_x.cols[2]) + dot(dL_dWc2, n_W2_x.cols[2]) +
-				dot(dL_dWc3, n_W3_x.cols[2]);
+				dot(dL_dWc3, n_W3_x.cols[2]); */
+
+	const float w[9] = {view_matrix[0], view_matrix[4], view_matrix[8],
+						view_matrix[1], view_matrix[5], view_matrix[9],
+						view_matrix[2], view_matrix[6], view_matrix[10]};
+	const float s[9] = {cov3D[0], cov3D[1], cov3D[2],
+						cov3D[1], cov3D[3], cov3D[4],
+						cov3D[2], cov3D[4], cov3D[5]};
+	const float j[6] = {h_x / t.z, 0.0f,      -(h_x * t.x) / (t.z * t.z),
+						0.0f,      h_y / t.z, -(h_y * t.y) / (t.z * t.z)};
+
+	const float da_dtx = w[3] * (j[2] * s[0] * (j[0] * w[0] + j[1] * w[3] + j[2] * w[6]) + j[2] * s[1] * (j[0] * w[1] + j[1] * w[4] + j[2] * w[7]) + j[2] * s[2] * (j[0] * w[2] + j[1] * w[5] + j[2] * w[8]) + j[2] * (s[0] * (j[0] * w[0] + j[1] * w[3] + j[2] * w[6]) + s[3] * (j[0] * w[1] + j[1] * w[4] + j[2] * w[7]) + s[6] * (j[0] * w[2] + j[1] * w[5] + j[2] * w[8]))) + w[4] * (j[2] * s[3] * (j[0] * w[0] + j[1] * w[3] + j[2] * w[6]) + j[2] * s[4] * (j[0] * w[1] + j[1] * w[4] + j[2] * w[7]) + j[2] * s[5] * (j[0] * w[2] + j[1] * w[5] + j[2] * w[8]) + j[2] * (s[1] * (j[0] * w[0] + j[1] * w[3] + j[2] * w[6]) + s[4] * (j[0] * w[1] + j[1] * w[4] + j[2] * w[7]) + s[7] * (j[0] * w[2] + j[1] * w[5] + j[2] * w[8]))) + w[5] * (j[2] * s[6] * (j[0] * w[0] + j[1] * w[3] + j[2] * w[6]) + j[2] * s[7] * (j[0] * w[1] + j[1] * w[4] + j[2] * w[7]) + j[2] * s[8] * (j[0] * w[2] + j[1] * w[5] + j[2] * w[8]) + j[2] * (s[2] * (j[0] * w[0] + j[1] * w[3] + j[2] * w[6]) + s[5] * (j[0] * w[1] + j[1] * w[4] + j[2] * w[7]) + s[8] * (j[0] * w[2] + j[1] * w[5] + j[2] * w[8]))) - w[6] * (j[1] * s[0] * (j[0] * w[0] + j[1] * w[3] + j[2] * w[6]) + j[1] * s[1] * (j[0] * w[1] + j[1] * w[4] + j[2] * w[7]) + j[1] * s[2] * (j[0] * w[2] + j[1] * w[5] + j[2] * w[8]) + j[1] * (s[0] * (j[0] * w[0] + j[1] * w[3] + j[2] * w[6]) + s[3] * (j[0] * w[1] + j[1] * w[4] + j[2] * w[7]) + s[6] * (j[0] * w[2] + j[1] * w[5] + j[2] * w[8]))) - w[7] * (j[1] * s[3] * (j[0] * w[0] + j[1] * w[3] + j[2] * w[6]) + j[1] * s[4] * (j[0] * w[1] + j[1] * w[4] + j[2] * w[7]) + j[1] * s[5] * (j[0] * w[2] + j[1] * w[5] + j[2] * w[8]) + j[1] * (s[1] * (j[0] * w[0] + j[1] * w[3] + j[2] * w[6]) + s[4] * (j[0] * w[1] + j[1] * w[4] + j[2] * w[7]) + s[7] * (j[0] * w[2] + j[1] * w[5] + j[2] * w[8]))) - w[8] * (j[1] * s[6] * (j[0] * w[0] + j[1] * w[3] + j[2] * w[6]) + j[1] * s[7] * (j[0] * w[1] + j[1] * w[4] + j[2] * w[7]) + j[1] * s[8] * (j[0] * w[2] + j[1] * w[5] + j[2] * w[8]) + j[1] * (s[2] * (j[0] * w[0] + j[1] * w[3] + j[2] * w[6]) + s[5] * (j[0] * w[1] + j[1] * w[4] + j[2] * w[7]) + s[8] * (j[0] * w[2] + j[1] * w[5] + j[2] * w[8])));
+    const float da_dty = -w[0] * (j[2] * s[0] * (j[0] * w[0] + j[1] * w[3] + j[2] * w[6]) + j[2] * s[1] * (j[0] * w[1] + j[1] * w[4] + j[2] * w[7]) + j[2] * s[2] * (j[0] * w[2] + j[1] * w[5] + j[2] * w[8]) + j[2] * (s[0] * (j[0] * w[0] + j[1] * w[3] + j[2] * w[6]) + s[3] * (j[0] * w[1] + j[1] * w[4] + j[2] * w[7]) + s[6] * (j[0] * w[2] + j[1] * w[5] + j[2] * w[8]))) - w[1] * (j[2] * s[3] * (j[0] * w[0] + j[1] * w[3] + j[2] * w[6]) + j[2] * s[4] * (j[0] * w[1] + j[1] * w[4] + j[2] * w[7]) + j[2] * s[5] * (j[0] * w[2] + j[1] * w[5] + j[2] * w[8]) + j[2] * (s[1] * (j[0] * w[0] + j[1] * w[3] + j[2] * w[6]) + s[4] * (j[0] * w[1] + j[1] * w[4] + j[2] * w[7]) + s[7] * (j[0] * w[2] + j[1] * w[5] + j[2] * w[8]))) - w[2] * (j[2] * s[6] * (j[0] * w[0] + j[1] * w[3] + j[2] * w[6]) + j[2] * s[7] * (j[0] * w[1] + j[1] * w[4] + j[2] * w[7]) + j[2] * s[8] * (j[0] * w[2] + j[1] * w[5] + j[2] * w[8]) + j[2] * (s[2] * (j[0] * w[0] + j[1] * w[3] + j[2] * w[6]) + s[5] * (j[0] * w[1] + j[1] * w[4] + j[2] * w[7]) + s[8] * (j[0] * w[2] + j[1] * w[5] + j[2] * w[8]))) + w[6] * (j[0] * s[0] * (j[0] * w[0] + j[1] * w[3] + j[2] * w[6]) + j[0] * s[1] * (j[0] * w[1] + j[1] * w[4] + j[2] * w[7]) + j[0] * s[2] * (j[0] * w[2] + j[1] * w[5] + j[2] * w[8]) + j[0] * (s[0] * (j[0] * w[0] + j[1] * w[3] + j[2] * w[6]) + s[3] * (j[0] * w[1] + j[1] * w[4] + j[2] * w[7]) + s[6] * (j[0] * w[2] + j[1] * w[5] + j[2] * w[8]))) + w[7] * (j[0] * s[3] * (j[0] * w[0] + j[1] * w[3] + j[2] * w[6]) + j[0] * s[4] * (j[0] * w[1] + j[1] * w[4] + j[2] * w[7]) + j[0] * s[5] * (j[0] * w[2] + j[1] * w[5] + j[2] * w[8]) + j[0] * (s[1] * (j[0] * w[0] + j[1] * w[3] + j[2] * w[6]) + s[4] * (j[0] * w[1] + j[1] * w[4] + j[2] * w[7]) + s[7] * (j[0] * w[2] + j[1] * w[5] + j[2] * w[8]))) + w[8] * (j[0] * s[6] * (j[0] * w[0] + j[1] * w[3] + j[2] * w[6]) + j[0] * s[7] * (j[0] * w[1] + j[1] * w[4] + j[2] * w[7]) + j[0] * s[8] * (j[0] * w[2] + j[1] * w[5] + j[2] * w[8]) + j[0] * (s[2] * (j[0] * w[0] + j[1] * w[3] + j[2] * w[6]) + s[5] * (j[0] * w[1] + j[1] * w[4] + j[2] * w[7]) + s[8] * (j[0] * w[2] + j[1] * w[5] + j[2] * w[8])));
+    const float da_dtz = w[0] * (j[1] * s[0] * (j[0] * w[0] + j[1] * w[3] + j[2] * w[6]) + j[1] * s[1] * (j[0] * w[1] + j[1] * w[4] + j[2] * w[7]) + j[1] * s[2] * (j[0] * w[2] + j[1] * w[5] + j[2] * w[8]) + j[1] * (s[0] * (j[0] * w[0] + j[1] * w[3] + j[2] * w[6]) + s[3] * (j[0] * w[1] + j[1] * w[4] + j[2] * w[7]) + s[6] * (j[0] * w[2] + j[1] * w[5] + j[2] * w[8]))) + w[1] * (j[1] * s[3] * (j[0] * w[0] + j[1] * w[3] + j[2] * w[6]) + j[1] * s[4] * (j[0] * w[1] + j[1] * w[4] + j[2] * w[7]) + j[1] * s[5] * (j[0] * w[2] + j[1] * w[5] + j[2] * w[8]) + j[1] * (s[1] * (j[0] * w[0] + j[1] * w[3] + j[2] * w[6]) + s[4] * (j[0] * w[1] + j[1] * w[4] + j[2] * w[7]) + s[7] * (j[0] * w[2] + j[1] * w[5] + j[2] * w[8]))) + w[2] * (j[1] * s[6] * (j[0] * w[0] + j[1] * w[3] + j[2] * w[6]) + j[1] * s[7] * (j[0] * w[1] + j[1] * w[4] + j[2] * w[7]) + j[1] * s[8] * (j[0] * w[2] + j[1] * w[5] + j[2] * w[8]) + j[1] * (s[2] * (j[0] * w[0] + j[1] * w[3] + j[2] * w[6]) + s[5] * (j[0] * w[1] + j[1] * w[4] + j[2] * w[7]) + s[8] * (j[0] * w[2] + j[1] * w[5] + j[2] * w[8]))) - w[3] * (j[0] * s[0] * (j[0] * w[0] + j[1] * w[3] + j[2] * w[6]) + j[0] * s[1] * (j[0] * w[1] + j[1] * w[4] + j[2] * w[7]) + j[0] * s[2] * (j[0] * w[2] + j[1] * w[5] + j[2] * w[8]) + j[0] * (s[0] * (j[0] * w[0] + j[1] * w[3] + j[2] * w[6]) + s[3] * (j[0] * w[1] + j[1] * w[4] + j[2] * w[7]) + s[6] * (j[0] * w[2] + j[1] * w[5] + j[2] * w[8]))) - w[4] * (j[0] * s[3] * (j[0] * w[0] + j[1] * w[3] + j[2] * w[6]) + j[0] * s[4] * (j[0] * w[1] + j[1] * w[4] + j[2] * w[7]) + j[0] * s[5] * (j[0] * w[2] + j[1] * w[5] + j[2] * w[8]) + j[0] * (s[1] * (j[0] * w[0] + j[1] * w[3] + j[2] * w[6]) + s[4] * (j[0] * w[1] + j[1] * w[4] + j[2] * w[7]) + s[7] * (j[0] * w[2] + j[1] * w[5] + j[2] * w[8]))) - w[5] * (j[0] * s[6] * (j[0] * w[0] + j[1] * w[3] + j[2] * w[6]) + j[0] * s[7] * (j[0] * w[1] + j[1] * w[4] + j[2] * w[7]) + j[0] * s[8] * (j[0] * w[2] + j[1] * w[5] + j[2] * w[8]) + j[0] * (s[2] * (j[0] * w[0] + j[1] * w[3] + j[2] * w[6]) + s[5] * (j[0] * w[1] + j[1] * w[4] + j[2] * w[7]) + s[8] * (j[0] * w[2] + j[1] * w[5] + j[2] * w[8])));
+
+    const float db_dtx = w[3] * (j[2] * s[0] * (j[3] * w[0] + j[4] * w[3] + j[5] * w[6]) + j[2] * s[1] * (j[3] * w[1] + j[4] * w[4] + j[5] * w[7]) + j[2] * s[2] * (j[3] * w[2] + j[4] * w[5] + j[5] * w[8]) + j[5] * (s[0] * (j[0] * w[0] + j[1] * w[3] + j[2] * w[6]) + s[3] * (j[0] * w[1] + j[1] * w[4] + j[2] * w[7]) + s[6] * (j[0] * w[2] + j[1] * w[5] + j[2] * w[8]))) + w[4] * (j[2] * s[3] * (j[3] * w[0] + j[4] * w[3] + j[5] * w[6]) + j[2] * s[4] * (j[3] * w[1] + j[4] * w[4] + j[5] * w[7]) + j[2] * s[5] * (j[3] * w[2] + j[4] * w[5] + j[5] * w[8]) + j[5] * (s[1] * (j[0] * w[0] + j[1] * w[3] + j[2] * w[6]) + s[4] * (j[0] * w[1] + j[1] * w[4] + j[2] * w[7]) + s[7] * (j[0] * w[2] + j[1] * w[5] + j[2] * w[8]))) + w[5] * (j[2] * s[6] * (j[3] * w[0] + j[4] * w[3] + j[5] * w[6]) + j[2] * s[7] * (j[3] * w[1] + j[4] * w[4] + j[5] * w[7]) + j[2] * s[8] * (j[3] * w[2] + j[4] * w[5] + j[5] * w[8]) + j[5] * (s[2] * (j[0] * w[0] + j[1] * w[3] + j[2] * w[6]) + s[5] * (j[0] * w[1] + j[1] * w[4] + j[2] * w[7]) + s[8] * (j[0] * w[2] + j[1] * w[5] + j[2] * w[8]))) - w[6] * (j[1] * s[0] * (j[3] * w[0] + j[4] * w[3] + j[5] * w[6]) + j[1] * s[1] * (j[3] * w[1] + j[4] * w[4] + j[5] * w[7]) + j[1] * s[2] * (j[3] * w[2] + j[4] * w[5] + j[5] * w[8]) + j[4] * (s[0] * (j[0] * w[0] + j[1] * w[3] + j[2] * w[6]) + s[3] * (j[0] * w[1] + j[1] * w[4] + j[2] * w[7]) + s[6] * (j[0] * w[2] + j[1] * w[5] + j[2] * w[8]))) - w[7] * (j[1] * s[3] * (j[3] * w[0] + j[4] * w[3] + j[5] * w[6]) + j[1] * s[4] * (j[3] * w[1] + j[4] * w[4] + j[5] * w[7]) + j[1] * s[5] * (j[3] * w[2] + j[4] * w[5] + j[5] * w[8]) + j[4] * (s[1] * (j[0] * w[0] + j[1] * w[3] + j[2] * w[6]) + s[4] * (j[0] * w[1] + j[1] * w[4] + j[2] * w[7]) + s[7] * (j[0] * w[2] + j[1] * w[5] + j[2] * w[8]))) - w[8] * (j[1] * s[6] * (j[3] * w[0] + j[4] * w[3] + j[5] * w[6]) + j[1] * s[7] * (j[3] * w[1] + j[4] * w[4] + j[5] * w[7]) + j[1] * s[8] * (j[3] * w[2] + j[4] * w[5] + j[5] * w[8]) + j[4] * (s[2] * (j[0] * w[0] + j[1] * w[3] + j[2] * w[6]) + s[5] * (j[0] * w[1] + j[1] * w[4] + j[2] * w[7]) + s[8] * (j[0] * w[2] + j[1] * w[5] + j[2] * w[8])));
+    const float db_dty = -w[0] * (j[2] * s[0] * (j[3] * w[0] + j[4] * w[3] + j[5] * w[6]) + j[2] * s[1] * (j[3] * w[1] + j[4] * w[4] + j[5] * w[7]) + j[2] * s[2] * (j[3] * w[2] + j[4] * w[5] + j[5] * w[8]) + j[5] * (s[0] * (j[0] * w[0] + j[1] * w[3] + j[2] * w[6]) + s[3] * (j[0] * w[1] + j[1] * w[4] + j[2] * w[7]) + s[6] * (j[0] * w[2] + j[1] * w[5] + j[2] * w[8]))) - w[1] * (j[2] * s[3] * (j[3] * w[0] + j[4] * w[3] + j[5] * w[6]) + j[2] * s[4] * (j[3] * w[1] + j[4] * w[4] + j[5] * w[7]) + j[2] * s[5] * (j[3] * w[2] + j[4] * w[5] + j[5] * w[8]) + j[5] * (s[1] * (j[0] * w[0] + j[1] * w[3] + j[2] * w[6]) + s[4] * (j[0] * w[1] + j[1] * w[4] + j[2] * w[7]) + s[7] * (j[0] * w[2] + j[1] * w[5] + j[2] * w[8]))) - w[2] * (j[2] * s[6] * (j[3] * w[0] + j[4] * w[3] + j[5] * w[6]) + j[2] * s[7] * (j[3] * w[1] + j[4] * w[4] + j[5] * w[7]) + j[2] * s[8] * (j[3] * w[2] + j[4] * w[5] + j[5] * w[8]) + j[5] * (s[2] * (j[0] * w[0] + j[1] * w[3] + j[2] * w[6]) + s[5] * (j[0] * w[1] + j[1] * w[4] + j[2] * w[7]) + s[8] * (j[0] * w[2] + j[1] * w[5] + j[2] * w[8]))) + w[6] * (j[0] * s[0] * (j[3] * w[0] + j[4] * w[3] + j[5] * w[6]) + j[0] * s[1] * (j[3] * w[1] + j[4] * w[4] + j[5] * w[7]) + j[0] * s[2] * (j[3] * w[2] + j[4] * w[5] + j[5] * w[8]) + j[3] * (s[0] * (j[0] * w[0] + j[1] * w[3] + j[2] * w[6]) + s[3] * (j[0] * w[1] + j[1] * w[4] + j[2] * w[7]) + s[6] * (j[0] * w[2] + j[1] * w[5] + j[2] * w[8]))) + w[7] * (j[0] * s[3] * (j[3] * w[0] + j[4] * w[3] + j[5] * w[6]) + j[0] * s[4] * (j[3] * w[1] + j[4] * w[4] + j[5] * w[7]) + j[0] * s[5] * (j[3] * w[2] + j[4] * w[5] + j[5] * w[8]) + j[3] * (s[1] * (j[0] * w[0] + j[1] * w[3] + j[2] * w[6]) + s[4] * (j[0] * w[1] + j[1] * w[4] + j[2] * w[7]) + s[7] * (j[0] * w[2] + j[1] * w[5] + j[2] * w[8]))) + w[8] * (j[0] * s[6] * (j[3] * w[0] + j[4] * w[3] + j[5] * w[6]) + j[0] * s[7] * (j[3] * w[1] + j[4] * w[4] + j[5] * w[7]) + j[0] * s[8] * (j[3] * w[2] + j[4] * w[5] + j[5] * w[8]) + j[3] * (s[2] * (j[0] * w[0] + j[1] * w[3] + j[2] * w[6]) + s[5] * (j[0] * w[1] + j[1] * w[4] + j[2] * w[7]) + s[8] * (j[0] * w[2] + j[1] * w[5] + j[2] * w[8])));
+    const float db_dtz = w[0] * (j[1] * s[0] * (j[3] * w[0] + j[4] * w[3] + j[5] * w[6]) + j[1] * s[1] * (j[3] * w[1] + j[4] * w[4] + j[5] * w[7]) + j[1] * s[2] * (j[3] * w[2] + j[4] * w[5] + j[5] * w[8]) + j[4] * (s[0] * (j[0] * w[0] + j[1] * w[3] + j[2] * w[6]) + s[3] * (j[0] * w[1] + j[1] * w[4] + j[2] * w[7]) + s[6] * (j[0] * w[2] + j[1] * w[5] + j[2] * w[8]))) + w[1] * (j[1] * s[3] * (j[3] * w[0] + j[4] * w[3] + j[5] * w[6]) + j[1] * s[4] * (j[3] * w[1] + j[4] * w[4] + j[5] * w[7]) + j[1] * s[5] * (j[3] * w[2] + j[4] * w[5] + j[5] * w[8]) + j[4] * (s[1] * (j[0] * w[0] + j[1] * w[3] + j[2] * w[6]) + s[4] * (j[0] * w[1] + j[1] * w[4] + j[2] * w[7]) + s[7] * (j[0] * w[2] + j[1] * w[5] + j[2] * w[8]))) + w[2] * (j[1] * s[6] * (j[3] * w[0] + j[4] * w[3] + j[5] * w[6]) + j[1] * s[7] * (j[3] * w[1] + j[4] * w[4] + j[5] * w[7]) + j[1] * s[8] * (j[3] * w[2] + j[4] * w[5] + j[5] * w[8]) + j[4] * (s[2] * (j[0] * w[0] + j[1] * w[3] + j[2] * w[6]) + s[5] * (j[0] * w[1] + j[1] * w[4] + j[2] * w[7]) + s[8] * (j[0] * w[2] + j[1] * w[5] + j[2] * w[8]))) - w[3] * (j[0] * s[0] * (j[3] * w[0] + j[4] * w[3] + j[5] * w[6]) + j[0] * s[1] * (j[3] * w[1] + j[4] * w[4] + j[5] * w[7]) + j[0] * s[2] * (j[3] * w[2] + j[4] * w[5] + j[5] * w[8]) + j[3] * (s[0] * (j[0] * w[0] + j[1] * w[3] + j[2] * w[6]) + s[3] * (j[0] * w[1] + j[1] * w[4] + j[2] * w[7]) + s[6] * (j[0] * w[2] + j[1] * w[5] + j[2] * w[8]))) - w[4] * (j[0] * s[3] * (j[3] * w[0] + j[4] * w[3] + j[5] * w[6]) + j[0] * s[4] * (j[3] * w[1] + j[4] * w[4] + j[5] * w[7]) + j[0] * s[5] * (j[3] * w[2] + j[4] * w[5] + j[5] * w[8]) + j[3] * (s[1] * (j[0] * w[0] + j[1] * w[3] + j[2] * w[6]) + s[4] * (j[0] * w[1] + j[1] * w[4] + j[2] * w[7]) + s[7] * (j[0] * w[2] + j[1] * w[5] + j[2] * w[8]))) - w[5] * (j[0] * s[6] * (j[3] * w[0] + j[4] * w[3] + j[5] * w[6]) + j[0] * s[7] * (j[3] * w[1] + j[4] * w[4] + j[5] * w[7]) + j[0] * s[8] * (j[3] * w[2] + j[4] * w[5] + j[5] * w[8]) + j[3] * (s[2] * (j[0] * w[0] + j[1] * w[3] + j[2] * w[6]) + s[5] * (j[0] * w[1] + j[1] * w[4] + j[2] * w[7]) + s[8] * (j[0] * w[2] + j[1] * w[5] + j[2] * w[8])));
+
+    const float dc_dtx = w[3] * (j[5] * s[0] * (j[3] * w[0] + j[4] * w[3] + j[5] * w[6]) + j[5] * s[1] * (j[3] * w[1] + j[4] * w[4] + j[5] * w[7]) + j[5] * s[2] * (j[3] * w[2] + j[4] * w[5] + j[5] * w[8]) + j[5] * (s[0] * (j[3] * w[0] + j[4] * w[3] + j[5] * w[6]) + s[3] * (j[3] * w[1] + j[4] * w[4] + j[5] * w[7]) + s[6] * (j[3] * w[2] + j[4] * w[5] + j[5] * w[8]))) + w[4] * (j[5] * s[3] * (j[3] * w[0] + j[4] * w[3] + j[5] * w[6]) + j[5] * s[4] * (j[3] * w[1] + j[4] * w[4] + j[5] * w[7]) + j[5] * s[5] * (j[3] * w[2] + j[4] * w[5] + j[5] * w[8]) + j[5] * (s[1] * (j[3] * w[0] + j[4] * w[3] + j[5] * w[6]) + s[4] * (j[3] * w[1] + j[4] * w[4] + j[5] * w[7]) + s[7] * (j[3] * w[2] + j[4] * w[5] + j[5] * w[8]))) + w[5] * (j[5] * s[6] * (j[3] * w[0] + j[4] * w[3] + j[5] * w[6]) + j[5] * s[7] * (j[3] * w[1] + j[4] * w[4] + j[5] * w[7]) + j[5] * s[8] * (j[3] * w[2] + j[4] * w[5] + j[5] * w[8]) + j[5] * (s[2] * (j[3] * w[0] + j[4] * w[3] + j[5] * w[6]) + s[5] * (j[3] * w[1] + j[4] * w[4] + j[5] * w[7]) + s[8] * (j[3] * w[2] + j[4] * w[5] + j[5] * w[8]))) - w[6] * (j[4] * s[0] * (j[3] * w[0] + j[4] * w[3] + j[5] * w[6]) + j[4] * s[1] * (j[3] * w[1] + j[4] * w[4] + j[5] * w[7]) + j[4] * s[2] * (j[3] * w[2] + j[4] * w[5] + j[5] * w[8]) + j[4] * (s[0] * (j[3] * w[0] + j[4] * w[3] + j[5] * w[6]) + s[3] * (j[3] * w[1] + j[4] * w[4] + j[5] * w[7]) + s[6] * (j[3] * w[2] + j[4] * w[5] + j[5] * w[8]))) - w[7] * (j[4] * s[3] * (j[3] * w[0] + j[4] * w[3] + j[5] * w[6]) + j[4] * s[4] * (j[3] * w[1] + j[4] * w[4] + j[5] * w[7]) + j[4] * s[5] * (j[3] * w[2] + j[4] * w[5] + j[5] * w[8]) + j[4] * (s[1] * (j[3] * w[0] + j[4] * w[3] + j[5] * w[6]) + s[4] * (j[3] * w[1] + j[4] * w[4] + j[5] * w[7]) + s[7] * (j[3] * w[2] + j[4] * w[5] + j[5] * w[8]))) - w[8] * (j[4] * s[6] * (j[3] * w[0] + j[4] * w[3] + j[5] * w[6]) + j[4] * s[7] * (j[3] * w[1] + j[4] * w[4] + j[5] * w[7]) + j[4] * s[8] * (j[3] * w[2] + j[4] * w[5] + j[5] * w[8]) + j[4] * (s[2] * (j[3] * w[0] + j[4] * w[3] + j[5] * w[6]) + s[5] * (j[3] * w[1] + j[4] * w[4] + j[5] * w[7]) + s[8] * (j[3] * w[2] + j[4] * w[5] + j[5] * w[8])));
+    const float dc_dty = -w[0] * (j[5] * s[0] * (j[3] * w[0] + j[4] * w[3] + j[5] * w[6]) + j[5] * s[1] * (j[3] * w[1] + j[4] * w[4] + j[5] * w[7]) + j[5] * s[2] * (j[3] * w[2] + j[4] * w[5] + j[5] * w[8]) + j[5] * (s[0] * (j[3] * w[0] + j[4] * w[3] + j[5] * w[6]) + s[3] * (j[3] * w[1] + j[4] * w[4] + j[5] * w[7]) + s[6] * (j[3] * w[2] + j[4] * w[5] + j[5] * w[8]))) - w[1] * (j[5] * s[3] * (j[3] * w[0] + j[4] * w[3] + j[5] * w[6]) + j[5] * s[4] * (j[3] * w[1] + j[4] * w[4] + j[5] * w[7]) + j[5] * s[5] * (j[3] * w[2] + j[4] * w[5] + j[5] * w[8]) + j[5] * (s[1] * (j[3] * w[0] + j[4] * w[3] + j[5] * w[6]) + s[4] * (j[3] * w[1] + j[4] * w[4] + j[5] * w[7]) + s[7] * (j[3] * w[2] + j[4] * w[5] + j[5] * w[8]))) - w[2] * (j[5] * s[6] * (j[3] * w[0] + j[4] * w[3] + j[5] * w[6]) + j[5] * s[7] * (j[3] * w[1] + j[4] * w[4] + j[5] * w[7]) + j[5] * s[8] * (j[3] * w[2] + j[4] * w[5] + j[5] * w[8]) + j[5] * (s[2] * (j[3] * w[0] + j[4] * w[3] + j[5] * w[6]) + s[5] * (j[3] * w[1] + j[4] * w[4] + j[5] * w[7]) + s[8] * (j[3] * w[2] + j[4] * w[5] + j[5] * w[8]))) + w[6] * (j[3] * s[0] * (j[3] * w[0] + j[4] * w[3] + j[5] * w[6]) + j[3] * s[1] * (j[3] * w[1] + j[4] * w[4] + j[5] * w[7]) + j[3] * s[2] * (j[3] * w[2] + j[4] * w[5] + j[5] * w[8]) + j[3] * (s[0] * (j[3] * w[0] + j[4] * w[3] + j[5] * w[6]) + s[3] * (j[3] * w[1] + j[4] * w[4] + j[5] * w[7]) + s[6] * (j[3] * w[2] + j[4] * w[5] + j[5] * w[8]))) + w[7] * (j[3] * s[3] * (j[3] * w[0] + j[4] * w[3] + j[5] * w[6]) + j[3] * s[4] * (j[3] * w[1] + j[4] * w[4] + j[5] * w[7]) + j[3] * s[5] * (j[3] * w[2] + j[4] * w[5] + j[5] * w[8]) + j[3] * (s[1] * (j[3] * w[0] + j[4] * w[3] + j[5] * w[6]) + s[4] * (j[3] * w[1] + j[4] * w[4] + j[5] * w[7]) + s[7] * (j[3] * w[2] + j[4] * w[5] + j[5] * w[8]))) + w[8] * (j[3] * s[6] * (j[3] * w[0] + j[4] * w[3] + j[5] * w[6]) + j[3] * s[7] * (j[3] * w[1] + j[4] * w[4] + j[5] * w[7]) + j[3] * s[8] * (j[3] * w[2] + j[4] * w[5] + j[5] * w[8]) + j[3] * (s[2] * (j[3] * w[0] + j[4] * w[3] + j[5] * w[6]) + s[5] * (j[3] * w[1] + j[4] * w[4] + j[5] * w[7]) + s[8] * (j[3] * w[2] + j[4] * w[5] + j[5] * w[8])));
+    const float dc_dtz = w[0] * (j[4] * s[0] * (j[3] * w[0] + j[4] * w[3] + j[5] * w[6]) + j[4] * s[1] * (j[3] * w[1] + j[4] * w[4] + j[5] * w[7]) + j[4] * s[2] * (j[3] * w[2] + j[4] * w[5] + j[5] * w[8]) + j[4] * (s[0] * (j[3] * w[0] + j[4] * w[3] + j[5] * w[6]) + s[3] * (j[3] * w[1] + j[4] * w[4] + j[5] * w[7]) + s[6] * (j[3] * w[2] + j[4] * w[5] + j[5] * w[8]))) + w[1] * (j[4] * s[3] * (j[3] * w[0] + j[4] * w[3] + j[5] * w[6]) + j[4] * s[4] * (j[3] * w[1] + j[4] * w[4] + j[5] * w[7]) + j[4] * s[5] * (j[3] * w[2] + j[4] * w[5] + j[5] * w[8]) + j[4] * (s[1] * (j[3] * w[0] + j[4] * w[3] + j[5] * w[6]) + s[4] * (j[3] * w[1] + j[4] * w[4] + j[5] * w[7]) + s[7] * (j[3] * w[2] + j[4] * w[5] + j[5] * w[8]))) + w[2] * (j[4] * s[6] * (j[3] * w[0] + j[4] * w[3] + j[5] * w[6]) + j[4] * s[7] * (j[3] * w[1] + j[4] * w[4] + j[5] * w[7]) + j[4] * s[8] * (j[3] * w[2] + j[4] * w[5] + j[5] * w[8]) + j[4] * (s[2] * (j[3] * w[0] + j[4] * w[3] + j[5] * w[6]) + s[5] * (j[3] * w[1] + j[4] * w[4] + j[5] * w[7]) + s[8] * (j[3] * w[2] + j[4] * w[5] + j[5] * w[8]))) - w[3] * (j[3] * s[0] * (j[3] * w[0] + j[4] * w[3] + j[5] * w[6]) + j[3] * s[1] * (j[3] * w[1] + j[4] * w[4] + j[5] * w[7]) + j[3] * s[2] * (j[3] * w[2] + j[4] * w[5] + j[5] * w[8]) + j[3] * (s[0] * (j[3] * w[0] + j[4] * w[3] + j[5] * w[6]) + s[3] * (j[3] * w[1] + j[4] * w[4] + j[5] * w[7]) + s[6] * (j[3] * w[2] + j[4] * w[5] + j[5] * w[8]))) - w[4] * (j[3] * s[3] * (j[3] * w[0] + j[4] * w[3] + j[5] * w[6]) + j[3] * s[4] * (j[3] * w[1] + j[4] * w[4] + j[5] * w[7]) + j[3] * s[5] * (j[3] * w[2] + j[4] * w[5] + j[5] * w[8]) + j[3] * (s[1] * (j[3] * w[0] + j[4] * w[3] + j[5] * w[6]) + s[4] * (j[3] * w[1] + j[4] * w[4] + j[5] * w[7]) + s[7] * (j[3] * w[2] + j[4] * w[5] + j[5] * w[8]))) - w[5] * (j[3] * s[6] * (j[3] * w[0] + j[4] * w[3] + j[5] * w[6]) + j[3] * s[7] * (j[3] * w[1] + j[4] * w[4] + j[5] * w[7]) + j[3] * s[8] * (j[3] * w[2] + j[4] * w[5] + j[5] * w[8]) + j[3] * (s[2] * (j[3] * w[0] + j[4] * w[3] + j[5] * w[6]) + s[5] * (j[3] * w[1] + j[4] * w[4] + j[5] * w[7]) + s[8] * (j[3] * w[2] + j[4] * w[5] + j[5] * w[8])));
+
+	float3 dL_dtheta = {};
+	/* TODO: sum up with dL_db * ... and dL_dc * ... */
+	dL_dtheta.x = dL_da * da_dtx + dL_db * db_dtx + dL_dc * dc_dtx;
+	dL_dtheta.y = dL_da * da_dty + dL_db * db_dty + dL_dc * dc_dty;
+	dL_dtheta.z = dL_da * da_dtz + dL_db * db_dtz + dL_dc * dc_dtz;
 
 	dL_dtau[6 * idx + 3] += dL_dtheta.x;
 	dL_dtau[6 * idx + 4] += dL_dtheta.y;
 	dL_dtau[6 * idx + 5] += dL_dtheta.z;
-
-
 }
 
 // Backward pass for the conversion of scale and rotation to a 
@@ -443,10 +494,11 @@ __global__ void preprocessCUDA(
 	if (idx >= P || !(radii[idx] > 0))
 		return;
 
+	/* uW */
 	float3 m = means[idx];
 
 	// Taking care of gradients from the screenspace points
-	float4 m_hom = transformPoint4x4(m, proj);
+	float4 m_hom = transformPoint4x4(m, proj);  /* uC */
 	float m_w = 1.0f / (m_hom.w + 0.0000001f);
 
 	// Compute loss gradient w.r.t. 3D means due to gradients of 2D means
@@ -462,24 +514,50 @@ __global__ void preprocessCUDA(
 	// of cov2D and following SH conversion also affects it.
 	dL_dmeans[idx] += dL_dmean;
 
-	float alpha = 1.0f * m_w;
-	float beta = -m_hom.x * m_w * m_w;
-	float gamma = -m_hom.y * m_w * m_w;
-
 	float a = proj_raw[0];
 	float b = proj_raw[5];
 	float c = proj_raw[10];
 	float d = proj_raw[14];
 	float e = proj_raw[11];
 
+	float zC = 1 / m_w;
+
 	SE3 T_CW(viewmatrix);
 	mat33 R = T_CW.R().data();
 	mat33 RT = R.transpose();
 	float3 t = T_CW.t();
-	float3 p_C = T_CW * m;
+	float3 p_C = T_CW * m;  /* uC */
 	mat33 dp_C_d_rho = mat33::identity();
-	mat33 dp_C_d_theta = -mat33::skew_symmetric(p_C);
+	mat33 dp_C_d_theta = -mat33::skew_symmetric(p_C);  // TODO: check calculation
 
+	float alpha = 1.0f * m_w;
+	float beta = -m_hom.x * m_w * m_w;
+	float gamma = -m_hom.y * m_w * m_w;
+	float zC2 = zC * zC;
+
+	/* NEW start */
+	/* float3 d_proj_dp_C1 = make_float3(alpha * a, 0.f,       -a * m_hom.x / zC2);
+	float3 d_proj_dp_C2 = make_float3(0.f,       alpha * b, -b * m_hom.y / zC2);
+
+	float3 d_proj_dp_C1_d_rho = {d_proj_dp_C1.x * dp_C_d_rho.cols[0].x + d_proj_dp_C1.y * dp_C_d_rho.cols[0].y + d_proj_dp_C1.z * dp_C_d_rho.cols[0].z,
+								 d_proj_dp_C1.x * dp_C_d_rho.cols[1].x + d_proj_dp_C1.y * dp_C_d_rho.cols[1].y + d_proj_dp_C1.z * dp_C_d_rho.cols[1].z,
+								 d_proj_dp_C1.x * dp_C_d_rho.cols[2].x + d_proj_dp_C1.y * dp_C_d_rho.cols[2].y + d_proj_dp_C1.z * dp_C_d_rho.cols[2].z,
+								 };
+	float3 d_proj_dp_C2_d_rho = {d_proj_dp_C2.x * dp_C_d_rho.cols[0].x + d_proj_dp_C2.y * dp_C_d_rho.cols[0].y + d_proj_dp_C2.z * dp_C_d_rho.cols[0].z,
+								 d_proj_dp_C2.x * dp_C_d_rho.cols[1].x + d_proj_dp_C2.y * dp_C_d_rho.cols[1].y + d_proj_dp_C2.z * dp_C_d_rho.cols[1].z,
+								 d_proj_dp_C2.x * dp_C_d_rho.cols[2].x + d_proj_dp_C2.y * dp_C_d_rho.cols[2].y + d_proj_dp_C2.z * dp_C_d_rho.cols[2].z,
+								 };
+	float3 d_proj_dp_C1_d_theta = {d_proj_dp_C1.x * dp_C_d_theta.cols[0].x + d_proj_dp_C1.y * dp_C_d_theta.cols[0].y + d_proj_dp_C1.z * dp_C_d_theta.cols[0].z,
+								   d_proj_dp_C1.x * dp_C_d_theta.cols[1].x + d_proj_dp_C1.y * dp_C_d_theta.cols[1].y + d_proj_dp_C1.z * dp_C_d_theta.cols[1].z,
+								   d_proj_dp_C1.x * dp_C_d_theta.cols[2].x + d_proj_dp_C1.y * dp_C_d_theta.cols[2].y + d_proj_dp_C1.z * dp_C_d_theta.cols[2].z,
+								   };
+	float3 d_proj_dp_C2_d_theta = {d_proj_dp_C2.x * dp_C_d_theta.cols[0].x + d_proj_dp_C2.y * dp_C_d_theta.cols[0].y + d_proj_dp_C2.z * dp_C_d_theta.cols[0].z,
+								   d_proj_dp_C2.x * dp_C_d_theta.cols[1].x + d_proj_dp_C2.y * dp_C_d_theta.cols[1].y + d_proj_dp_C2.z * dp_C_d_theta.cols[1].z,
+								   d_proj_dp_C2.x * dp_C_d_theta.cols[2].x + d_proj_dp_C2.y * dp_C_d_theta.cols[2].y + d_proj_dp_C2.z * dp_C_d_theta.cols[2].z,
+								   }; */
+	/* NEW end */
+
+	/* OLD start */
 	float3 d_proj_dp_C1 = make_float3(alpha * a, 0.f, beta * e);
 	float3 d_proj_dp_C2 = make_float3(0.f, alpha * b, gamma * e);
 
@@ -487,7 +565,10 @@ __global__ void preprocessCUDA(
 	float3 d_proj_dp_C2_d_rho = dp_C_d_rho.transpose() * d_proj_dp_C2;
 	float3 d_proj_dp_C1_d_theta = dp_C_d_theta.transpose() * d_proj_dp_C1;
 	float3 d_proj_dp_C2_d_theta = dp_C_d_theta.transpose() * d_proj_dp_C2;
+ 	
+ 	/* OLD end */
 
+	/* CHECKED: the concept is correct */
 	float2 dmean2D_dtau[6];
 	dmean2D_dtau[0].x = d_proj_dp_C1_d_rho.x;
 	dmean2D_dtau[1].x = d_proj_dp_C1_d_rho.y;
@@ -496,6 +577,7 @@ __global__ void preprocessCUDA(
 	dmean2D_dtau[4].x = d_proj_dp_C1_d_theta.y;
 	dmean2D_dtau[5].x = d_proj_dp_C1_d_theta.z;
 
+	/* CHECKED: the concept is correct */
 	dmean2D_dtau[0].y = d_proj_dp_C2_d_rho.x;
 	dmean2D_dtau[1].y = d_proj_dp_C2_d_rho.y;
 	dmean2D_dtau[2].y = d_proj_dp_C2_d_rho.z;
@@ -519,15 +601,6 @@ __global__ void preprocessCUDA(
 	dL_dmeans[idx].x += dL_dpCz * viewmatrix[2];
 	dL_dmeans[idx].y += dL_dpCz * viewmatrix[6];
 	dL_dmeans[idx].z += dL_dpCz * viewmatrix[10];
-
-	for (int i = 0; i < 3; i++) {
-		float3 c_rho = dp_C_d_rho.cols[i];
-		float3 c_theta = dp_C_d_theta.cols[i];
-		dL_dtau[6 * idx + i] += dL_dpCz * c_rho.z;
-		dL_dtau[6 * idx + i + 3] += dL_dpCz * c_theta.z;
-	}
-
-
 
 	// Compute gradient updates due to computing colors from SHs
 	if (shs)
